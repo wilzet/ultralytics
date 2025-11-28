@@ -12,6 +12,8 @@ import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
+    PadoOpticsConfig,
+    PadoOpticsFrontEnd,
     AIFI,
     C1,
     C2,

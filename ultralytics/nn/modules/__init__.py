@@ -18,6 +18,8 @@ Examples:
 """
 
 from .block import (
+    PadoOpticsConfig,
+    PadoOpticsFrontEnd,
     C1,
     C2,
     C2PSA,

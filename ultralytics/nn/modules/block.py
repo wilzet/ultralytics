@@ -54,6 +54,87 @@ __all__ = (
     "TorchVision",
 )
 
+# --------------------------- Custom PADO Block ------------------------------
+import dataclasses as dc
+import pado
+from typing import Tuple
+from pado import mm, nm
+
+# ----------------------------- Configuration --------------------------------
+@dc.dataclass
+class PadoOpticsConfig:
+    psf_size: int = 129               # PSF spatial support (odd)
+    wavelengths_nm: Tuple[float, ...] = (550.0,)  # default single channel
+    depths_diopter: Tuple[float, ...] = (1.0,)    # diopters; infinity==0
+    rand_height_noise_nm: float = 20.0            # robustness noise
+
+    # --- pado(ASM) specific params matching Assignment 2 recipe ---
+    pinhole_diameter_mm: float = 0.1 # pinhole_diameter = 0.1*mm
+    focal_length_mm: float = 200.0 # focal_length = 200*mm
+    screen_size_mm: float = 50.0 # screen_size = 50*mm
+    resolution: int = 500 # resolution of the screen
+
+class PadoOpticsFrontEnd(nn.Module):
+    def __init__(self, cfg: PadoOpticsConfig | None = None):
+        super().__init__()
+        if not cfg:
+            cfg = PadoOpticsConfig()
+
+        self.cfg = cfg
+
+        S = cfg.psf_size
+        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S))
+        
+        self.lambdas_nm = [460.0, 550.0, 640.0]
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert C == 3, "This setup expects RGB images"
+
+        h = self.doe_height
+        psfs = self.psf_simulation(h)
+        psfs = psfs.unsqueeze(1)  # (3, 1, S, S)
+
+        return F.conv2d(x, psfs, padding="same", groups=3) # (B, 3, H, W)
+    
+    def psf_simulation(self, doe_height: torch.Tensor) -> torch.Tensor:
+        S = self.cfg.psf_size
+        R = self.cfg.resolution
+        pitch = (self.cfg.screen_size_mm * mm) / R
+        dim = (1, 1, R, R)
+        
+        height = F.interpolate(doe_height, size=(R,R), mode='bilinear', align_corners=False)
+        device = doe_height.device
+        
+        material = pado.Material('FUSED_SILICA')
+        prop_distance = self.cfg.focal_length_mm * mm
+        diameter = self.cfg.pinhole_diameter_mm * mm
+        
+        pinhole = pado.optical_element.Aperture(dim, pitch, diameter, 'circle', 1)
+        doe = pado.optical_element.DOE(dim, pitch, material, 1, device, height=height)
+        prop = pado.propagator.Propagator('ASM')
+
+        cy, cx = R // 2, R // 2
+        r = S // 2
+
+        psfs = torch.empty((len(self.lambdas_nm), S, S), device=device, dtype=torch.float32)
+        for i, lam in enumerate(self.lambdas_nm):
+            wvl = lam * nm
+            light = pado.light.Light(dim, pitch, wvl)
+            pinhole.set_wvl(wvl)
+            doe.change_wvl(wvl)
+
+            light_after_pinhole = pinhole.forward(light)
+            light_after_doe = doe.forward(light_after_pinhole)
+            light_after_prop = prop.forward(light_after_doe, prop_distance)
+
+            I = light_after_prop.get_intensity()[0, 0]
+            I = I[cy - r:cy + r + 1, cx - r:cx + r + 1]
+            psfs[i] = I / (I.sum() + 1e-12)
+
+        return psfs
+
+# ------------------------- Custom PADO Block End ----------------------------
 
 class DFL(nn.Module):
     """Integral module of Distribution Focal Loss (DFL).
