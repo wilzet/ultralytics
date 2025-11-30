@@ -92,8 +92,10 @@ class PadoOpticsFrontEnd(nn.Module):
         assert C == 3, "This setup expects RGB images"
 
         h = self.doe_height
+        h = h.to(x.device)
         psfs = self.psf_simulation(h)
         psfs = psfs.unsqueeze(1)  # (3, 1, S, S)
+        psfs = psfs.to(x.dtype)
 
         return F.conv2d(x, psfs, padding="same", groups=3) # (B, 3, H, W)
     
@@ -110,8 +112,8 @@ class PadoOpticsFrontEnd(nn.Module):
         prop_distance = self.cfg.focal_length_mm * mm
         diameter = self.cfg.pinhole_diameter_mm * mm
         
-        pinhole = pado.optical_element.Aperture(dim, pitch, diameter, 'circle', 1)
-        doe = pado.optical_element.DOE(dim, pitch, material, 1, device, height=height)
+        pinhole = pado.optical_element.Aperture(dim, pitch, diameter, 'circle', 1, device=device)
+        doe = pado.optical_element.DOE(dim, pitch, material, 1, device=device, height=height)
         prop = pado.propagator.Propagator('ASM')
 
         cy, cx = R // 2, R // 2
@@ -120,7 +122,7 @@ class PadoOpticsFrontEnd(nn.Module):
         psfs = torch.empty((len(self.lambdas_nm), S, S), device=device, dtype=torch.float32)
         for i, lam in enumerate(self.lambdas_nm):
             wvl = lam * nm
-            light = pado.light.Light(dim, pitch, wvl)
+            light = pado.light.Light(dim, pitch, wvl, device=device)
             pinhole.set_wvl(wvl)
             doe.change_wvl(wvl)
 
