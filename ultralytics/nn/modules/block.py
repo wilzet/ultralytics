@@ -94,16 +94,20 @@ class PadoOpticsFrontEnd(nn.Module):
         self.prop_distance = self.cfg.focal_length_mm * mm
         self.diameter = self.cfg.pinhole_diameter_mm * mm
 
-        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S))
+        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         assert C == 3, "This setup expects RGB images"
 
-        h = self.doe_height
-        h.to(x.device)
-        psfs = self.psf_simulation(h)
-        psfs = psfs.unsqueeze(1)  # (3, 1, S, S)
+        in_type = x.dtype
+        with torch.autocast(x.device.type, enabled=False):
+            x = x.float()
+            h = self.doe_height.to(x.device).float()
+            psfs = self.psf_simulation(h).unsqueeze(1).float()  # (3, 1, S, S)
+
+        psfs = psfs.to(in_type)
+        x = x.to(in_type)
 
         return F.conv2d(x, psfs, padding="same", groups=3) # (B, 3, H, W)
     
@@ -117,7 +121,7 @@ class PadoOpticsFrontEnd(nn.Module):
         pinhole = pado.optical_element.Aperture(self.dim, self.pitch, self.diameter, 'circle', 1, device=device)
         doe = pado.optical_element.DOE(self.dim, self.pitch, self.material, 1, device=device, height=height)
 
-        psfs = torch.empty((len(self.lambdas_nm), S, S), device=device)
+        psfs = torch.empty((len(self.lambdas_nm), S, S), device=device, dtype=torch.float32)
         for i, lam in enumerate(self.lambdas_nm):
             wvl = lam * nm
             light = pado.light.Light(self.dim, self.pitch, wvl, device=device)
