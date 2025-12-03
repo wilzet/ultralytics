@@ -101,14 +101,14 @@ class PadoOpticsFrontEnd(nn.Module):
         self.crop_slice = (slice(crop_start, crop_end), slice(crop_start, crop_end))
 
     def ensure_optical_elements(self, device: torch.device):
-        if self.pinhole is None:
+        if self.pinhole is None or self.pinhole.device != device:
             self.pinhole = pado.optical_element.Aperture(self.dim, self.pitch, self.diameter, 'circle', 1, device=device)
 
-        if self.doe is None:
+        if self.doe is None or self.doe.device != device:
             self.doe = pado.optical_element.DOE(self.dim, self.pitch, self.material, 1, device=device)
 
-        if self.psf_stack is None:
-            self.psf_stack = torch.empty((len(self.lambdas_nm), self.cfg.psf_size, self.cfg.psf_size), device=device)
+        # if self.psf_stack is None or self.psf_stack.device != device:
+        #     self.psf_stack = torch.empty((len(self.lambdas_nm), self.cfg.psf_size, self.cfg.psf_size), device=device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -127,8 +127,9 @@ class PadoOpticsFrontEnd(nn.Module):
     
     def psf_simulation(self, doe_height: torch.Tensor) -> torch.Tensor:
         height = F.interpolate(doe_height, size=(self.cfg.resolution, self.cfg.resolution), mode='bilinear', align_corners=False)
-        self.doe.set_height(height)
+        self.doe.set_height(height.to(doe_height.device))
 
+        psfs: list[torch.Tensor] = []
         for i, lam in enumerate(self.lambdas_nm):
             wvl = lam * nm
             light = pado.light.Light(self.dim, self.pitch, wvl, device=doe_height.device)
@@ -141,9 +142,9 @@ class PadoOpticsFrontEnd(nn.Module):
 
             I = light_after_prop.get_intensity()[0, 0]
             I = I[self.crop_slice]
-            self.psf_stack[i] = I / (I.sum() + 1e-12)
+            psfs.append(I / (I.sum() + 1e-12))
 
-        return self.psf_stack
+        return torch.stack(psfs, dim=0)
 
     def __deepcopy__(self, memo):
         new_obj = PadoOpticsFrontEnd(self.cfg)
