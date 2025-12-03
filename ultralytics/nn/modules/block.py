@@ -146,9 +146,6 @@ class PadoOpticsFrontEnd(nn.Module):
         return self.psf_stack
 
     def __deepcopy__(self, memo):
-        if memo[id(self)]:
-            return memo[id(self)]
-        
         new_obj = PadoOpticsFrontEnd(self.cfg)
         memo[id(self)] = new_obj
         new_obj.doe_height = self.doe_height.__deepcopy__(memo)
