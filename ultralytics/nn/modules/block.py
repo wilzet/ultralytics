@@ -64,9 +64,6 @@ from pado import mm, nm
 @dc.dataclass
 class PadoOpticsConfig:
     psf_size: int = 129               # PSF spatial support (odd)
-    wavelengths_nm: Tuple[float, ...] = (550.0,)  # default single channel
-    depths_diopter: Tuple[float, ...] = (1.0,)    # diopters; infinity==0
-    rand_height_noise_nm: float = 20.0            # robustness noise
 
     # --- pado(ASM) specific params matching Assignment 2 recipe ---
     pinhole_diameter_mm: float = 0.1 # pinhole_diameter = 0.1*mm
@@ -80,49 +77,61 @@ class PadoOpticsFrontEnd(nn.Module):
         if not cfg:
             cfg = PadoOpticsConfig()
 
+        self.cfg = cfg
         self.lambdas_nm = [460.0, 550.0, 640.0]
 
         S = cfg.psf_size
         R = cfg.resolution
-        self.R = R
         self.pitch = cfg.screen_size_mm * mm / R
         self.dim = (1, 1, R, R)
-        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S))
         self.prop_distance = cfg.focal_length_mm * mm
         self.diameter = cfg.pinhole_diameter_mm * mm
 
+        self.pinhole = None
+        self.doe = None
+        self.prop = pado.propagator.Propagator('ASM')
+        self.psf_stack = None
+        self.material = pado.Material('FUSED_SILICA')
+        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S))
+
         c_xy = R // 2
         r = S // 2
-        self.crop_start = c_xy - r
-        self.crop_end = c_xy + r + 1
-        self.device = self.doe_height.device
-        
-        self.material = pado.Material('FUSED_SILICA')
-        self.pinhole = pado.optical_element.Aperture(self.dim, self.pitch, self.diameter, 'circle', 1, device=self.device)
-        self.doe = pado.optical_element.DOE(self.dim, self.pitch, self.material, 1, device=self.device)
-        self.prop = pado.propagator.Propagator('ASM')
+        crop_start = c_xy - r
+        crop_end = c_xy + r + 1
+        self.crop_slice = (slice(crop_start, crop_end), slice(crop_start, crop_end))
 
-        self.psfs = torch.empty((len(self.lambdas_nm), S, S), device=self.device)
+    def ensure_optical_elements(self, device: torch.device):
+        if self.pinhole is None:
+            self.pinhole = pado.optical_element.Aperture(self.dim, self.pitch, self.diameter, 'circle', 1, device=device)
+
+        if self.doe is None:
+            self.doe = pado.optical_element.DOE(self.dim, self.pitch, self.material, 1, device=device)
+
+        if self.psf_stack is None:
+            self.psf_stack = torch.empty((len(self.lambdas_nm), self.cfg.psf_size, self.cfg.psf_size), device=device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         assert C == 3, "This setup expects RGB images"
 
+        self.ensure_optical_elements(x.device)
+
         h = self.doe_height
         h = h.to(x.device)
-        with torch.amp.autocast(self.device.type, enabled=False):
+        with torch.amp.autocast(x.device.type, enabled=False):
             psfs = self.psf_simulation(h).unsqueeze(1) # (3, 1, S, S)
+        
         psfs = psfs.to(x.dtype)
 
         return F.conv2d(x, psfs, padding="same", groups=3) # (B, 3, H, W)
     
-    def psf_simulation(self, doe_height: torch.Tensor) -> torch.Tensor:        
-        height = F.interpolate(doe_height, size=(self.R,self.R), mode='bilinear', align_corners=False)
+    def psf_simulation(self, doe_height: torch.Tensor) -> torch.Tensor:
+        height = F.interpolate(doe_height, size=(self.cfg.resolution, self.cfg.resolution), mode='bilinear', align_corners=False)
         self.doe.set_height(height)
 
         for i, lam in enumerate(self.lambdas_nm):
             wvl = lam * nm
-            light = pado.light.Light(self.dim, self.pitch, wvl, device=self.device)
+            light = pado.light.Light(self.dim, self.pitch, wvl, device=doe_height.device)
             self.pinhole.set_wvl(wvl)
             self.doe.change_wvl(wvl)
 
@@ -131,10 +140,21 @@ class PadoOpticsFrontEnd(nn.Module):
             light_after_prop = self.prop.forward(light_after_doe, self.prop_distance)
 
             I = light_after_prop.get_intensity()[0, 0]
-            I = I[self.crop_start:self.crop_end, self.crop_start:self.crop_end]
-            self.psfs[i] = I / (I.sum() + 1e-12)
+            I = I[self.crop_slice]
+            self.psf_stack[i] = I / (I.sum() + 1e-12)
 
-        return self.psfs
+        return self.psf_stack
+
+    def __deepcopy__(self, memo):
+        if memo[id(self)]:
+            return memo[id(self)]
+        
+        new_obj = PadoOpticsFrontEnd(self.cfg)
+        memo[id(self)] = new_obj
+        new_obj.doe_height = self.doe_height.__deepcopy__(memo)
+        
+        return new_obj
+        
 
 # ------------------------- Custom PADO Block End ----------------------------
 
