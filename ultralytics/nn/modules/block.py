@@ -82,78 +82,58 @@ class PadoOpticsFrontEnd(nn.Module):
 
         S = cfg.psf_size
         R = cfg.resolution
-        self.pitch = cfg.screen_size_mm * mm / R
+        self.pitch = (self.cfg.screen_size_mm * mm) / R
         self.dim = (1, 1, R, R)
-        self.prop_distance = cfg.focal_length_mm * mm
-        self.diameter = cfg.pinhole_diameter_mm * mm
-
-        self.pinhole = None
-        self.doe = None
-        self.prop = pado.propagator.Propagator('ASM')
-        self.psf_stack = None
-        self.material = pado.Material('FUSED_SILICA')
-        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S))
 
         c_xy = R // 2
         r = S // 2
-        crop_start = c_xy - r
-        crop_end = c_xy + r + 1
-        self.crop_slice = (slice(crop_start, crop_end), slice(crop_start, crop_end))
+        self.crop_slice = (slice(c_xy - r, c_xy + r + 1), slice(c_xy - r, c_xy + r + 1))
 
-    def ensure_optical_elements(self, device: torch.device):
-        if self.pinhole is None or self.pinhole.device != device:
-            self.pinhole = pado.optical_element.Aperture(self.dim, self.pitch, self.diameter, 'circle', 1, device=device)
+        self.material = pado.Material('FUSED_SILICA')
+        self.prop = pado.propagator.Propagator('ASM')
+        self.prop_distance = self.cfg.focal_length_mm * mm
+        self.diameter = self.cfg.pinhole_diameter_mm * mm
 
-        if self.doe is None or self.doe.device != device:
-            self.doe = pado.optical_element.DOE(self.dim, self.pitch, self.material, 1, device=device)
-
-        # if self.psf_stack is None or self.psf_stack.device != device:
-        #     self.psf_stack = torch.empty((len(self.lambdas_nm), self.cfg.psf_size, self.cfg.psf_size), device=device)
+        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         assert C == 3, "This setup expects RGB images"
 
-        self.ensure_optical_elements(x.device)
-
         h = self.doe_height
-        h = h.to(x.device)
-        with torch.amp.autocast(x.device.type, enabled=False):
-            psfs = self.psf_simulation(h).unsqueeze(1) # (3, 1, S, S)
-        
-        psfs = psfs.to(x.dtype)
+        h.to(x.device)
+        psfs = self.psf_simulation(h)
+        psfs = psfs.unsqueeze(1)  # (3, 1, S, S)
 
         return F.conv2d(x, psfs, padding="same", groups=3) # (B, 3, H, W)
     
     def psf_simulation(self, doe_height: torch.Tensor) -> torch.Tensor:
-        height = F.interpolate(doe_height, size=(self.cfg.resolution, self.cfg.resolution), mode='bilinear', align_corners=False)
-        self.doe.set_height(height.to(doe_height.device))
+        S = self.cfg.psf_size
+        R = self.cfg.resolution
 
-        psfs: list[torch.Tensor] = []
+        height = F.interpolate(doe_height, size=(R, R), mode='bilinear', align_corners=False)
+        device = doe_height.device
+        
+        pinhole = pado.optical_element.Aperture(self.dim, self.pitch, self.diameter, 'circle', 1, device=device)
+        doe = pado.optical_element.DOE(self.dim, self.pitch, self.material, 1, device=device, height=height)
+
+        psfs = torch.empty((len(self.lambdas_nm), S, S), device=device)
         for i, lam in enumerate(self.lambdas_nm):
             wvl = lam * nm
-            light = pado.light.Light(self.dim, self.pitch, wvl, device=doe_height.device)
-            self.pinhole.set_wvl(wvl)
-            self.doe.change_wvl(wvl)
+            light = pado.light.Light(self.dim, self.pitch, wvl, device=device)
+            pinhole.set_wvl(wvl)
+            doe.change_wvl(wvl)
 
-            light_after_pinhole = self.pinhole.forward(light)
-            light_after_doe = self.doe.forward(light_after_pinhole)
+            light_after_pinhole = pinhole.forward(light)
+            light_after_doe = doe.forward(light_after_pinhole)
             light_after_prop = self.prop.forward(light_after_doe, self.prop_distance)
 
             I = light_after_prop.get_intensity()[0, 0]
             I = I[self.crop_slice]
-            psfs.append(I / (I.sum() + 1e-12))
+            psfs[i] = I / (I.sum() + 1e-12)
 
-        return torch.stack(psfs, dim=0)
-
-    def __deepcopy__(self, memo):
-        new_obj = PadoOpticsFrontEnd(self.cfg)
-        memo[id(self)] = new_obj
-        new_obj.doe_height = self.doe_height.__deepcopy__(memo)
+        return psfs
         
-        return new_obj
-        
-
 # ------------------------- Custom PADO Block End ----------------------------
 
 class DFL(nn.Module):
