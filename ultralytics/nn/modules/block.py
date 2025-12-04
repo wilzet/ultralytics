@@ -6,6 +6,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import time
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -94,7 +96,13 @@ class PadoOpticsFrontEnd(nn.Module):
         self.prop_distance = self.cfg.focal_length_mm * mm
         self.diameter = self.cfg.pinhole_diameter_mm * mm
 
-        self.doe_height = nn.Parameter(torch.zeros(1, 1, S, S, dtype=torch.float32))
+        # self.doe_height = nn.Parameter(torch.randn(1, 1, S, S, dtype=torch.float32))
+        self.register_buffer('plane_doe', torch.ones(1, 1, S, S, dtype=torch.float32) * 5e-7)  # 500 nm
+        self.height_offset = nn.Parameter(torch.zeros(1, 1, S, S, dtype=torch.float32))
+
+    def doe_height_m(self) -> torch.Tensor:
+        """Get the DOE height in meters."""
+        return torch.clamp(self.plane_doe + self.height_offset * 1e-8, min=4e-7, max=6e-7)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -103,13 +111,28 @@ class PadoOpticsFrontEnd(nn.Module):
         in_type = x.dtype
         with torch.autocast(x.device.type, enabled=False):
             x = x.float()
-            h = self.doe_height.to(x.device).float()
+            h = self.doe_height_m().to(x.device).float()
             psfs = self.psf_simulation(h).unsqueeze(1).float()  # (3, 1, S, S)
 
         psfs = psfs.to(in_type)
         x = x.to(in_type)
 
         return F.conv2d(x, psfs, padding="same", groups=3) # (B, 3, H, W)
+    
+    def log_psfs(self, psfs: torch.Tensor) -> None:
+        """Log PSFs for visualization."""
+        # check if we are in train or eval mode
+        if self.training:
+            return
+        
+        out_file = 'psfs.png'
+        psfs_np = psfs.detach().cpu().numpy()
+        fig, axs = plt.subplots(1, len(self.lambdas_nm), figsize=(15, 5))
+        for i, lam in enumerate(self.lambdas_nm):
+            axs[i].imshow(psfs_np[i, 0], cmap='gray')
+            axs[i].set_title(f'PSF at {lam} nm')
+            axs[i].axis('off')
+        plt.show()
     
     def psf_simulation(self, doe_height: torch.Tensor) -> torch.Tensor:
         S = self.cfg.psf_size
